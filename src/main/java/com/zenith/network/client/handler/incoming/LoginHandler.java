@@ -73,9 +73,11 @@ public class LoginHandler implements PacketHandler<ClientboundLoginPacket, Clien
         }
 
         if (!Proxy.getInstance().isOn2b2t()) {
-            if (!session.isOnline()) {
-                session.setOnline(true);
-                EVENT_BUS.post(new ClientOnlineEvent());
+            if (!CONFIG.authentication.serverLoginRequired) {
+                if (!session.isOnline()) {
+                    session.setOnline(true);
+                    EVENT_BUS.post(new ClientOnlineEvent());
+                }
             }
         }
         return packet;
