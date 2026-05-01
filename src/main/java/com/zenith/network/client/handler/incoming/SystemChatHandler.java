@@ -39,6 +39,9 @@ public class SystemChatHandler implements ClientEventLoopPacketHandler<Clientbou
             final Component component = packet.getContent();
             String messageString = ComponentSerializer.serializePlain(component);
 
+            // DEBUG: Log all system chat messages to help identify lobby/auth prompts
+            // Remove this line after you've captured the 6b6t lobby strings
+            CLIENT_LOG.info("[LOBBY DEBUG] {}", messageString);
             if (Proxy.getInstance().isOn2b2t()) {
                 if ("Reconnecting to server 2b2t.".equals(messageString)
                     && NamedTextColor.GOLD.equals(component.style().color())) {
