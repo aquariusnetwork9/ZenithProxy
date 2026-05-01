@@ -3,15 +3,20 @@ package com.zenith.module.impl;
 import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
 import com.zenith.event.chat.SystemChatEvent;
+import com.zenith.event.client.ClientBotTick;
 import com.zenith.event.client.ClientConnectEvent;
 import com.zenith.event.client.ClientDisconnectEvent;
 import com.zenith.event.client.ClientOnlineEvent;
+import com.zenith.feature.player.Input;
+import com.zenith.feature.player.InputRequest;
+import com.zenith.feature.player.RotationHelper;
+import com.zenith.feature.player.World;
+import com.zenith.mc.block.BlockPos;
 import com.zenith.module.api.Module;
+import com.zenith.util.math.MathHelper;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundChatPacket;
-import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerPosRotPacket;
 
 import java.util.List;
-import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -22,11 +27,16 @@ import static com.zenith.Globals.*;
  * Handles /login and /register for cracked servers like 6b6t.
  *
  * Flow:
- *   1. WAITING      - Waits for login/register prompt
+ *   1. WAITING        - Waits for login/register prompt
  *   2. AUTHENTICATING - Sent /login, waiting for success
- *   3. WAITING_TELEPORT - Login succeeded, waiting for 6b6t to teleport us to the portal lobby
- *   4. WALKING      - Walking forward toward the portal using raw position packets
- *   5. DONE         - Through the portal, fully online
+ *   3. WAITING_TELEPORT - Login succeeded, waiting for teleport to portal lobby
+ *   4. WALKING        - Marked online, using proper physics to walk through portal
+ *   5. DONE           - Through the portal (or walk finished)
+ *
+ * Key insight: we mark the bot as "online" BEFORE walking through the portal.
+ * This starts ZenithProxy's full physics simulation (Bot ticks, INPUTS system),
+ * which properly handles gravity, ground detection, and movement the server accepts.
+ * Raw position packets get rejected by anti-cheat without physics simulation.
  */
 public class ServerLogin extends Module {
 
@@ -42,21 +52,16 @@ public class ServerLogin extends Module {
     private boolean sentLoginCommand = false;
 
     // Walk phase
-    private ScheduledFuture<?> walkTask;
-    private double walkX, walkY, walkZ;     // current walk position
-    private double walkDirX, walkDirZ;      // direction to walk (unit vector)
-    private float walkYaw, walkPitch;       // facing direction
-    private double startX, startZ;          // position when walk started
+    private BlockPos walkGoal;
+    private double startX, startZ;
     private int walkTicks = 0;
 
-    // Walking speed: ~4.3 blocks/sec = ~0.215 blocks/tick at 20tps
-    private static final double WALK_SPEED = 0.215;
-    // Max blocks to walk before giving up
-    private static final int MAX_WALK_DISTANCE = 20;
-    // If position jumps more than this from walk start, portal detected
+    // How far to walk toward the portal
+    private static final int WALK_DISTANCE = 15;
+    // If position jumps this far from walk start, portal was reached
     private static final double PORTAL_DETECT_DISTANCE = 30.0;
-    // Max ticks to walk (15 seconds)
-    private static final int MAX_WALK_TICKS = 300;
+    // Max ticks to walk (20 seconds at 20tps)
+    private static final int MAX_WALK_TICKS = 400;
     // Seconds to wait after login for teleport to portal lobby
     private static final int TELEPORT_WAIT_SECONDS = 4;
 
@@ -65,7 +70,8 @@ public class ServerLogin extends Module {
         return List.of(
             of(SystemChatEvent.class, this::handleSystemChat),
             of(ClientConnectEvent.class, this::handleConnect),
-            of(ClientDisconnectEvent.class, this::handleDisconnect)
+            of(ClientDisconnectEvent.class, this::handleDisconnect),
+            of(ClientBotTick.class, this::handleTick)
         );
     }
 
@@ -86,15 +92,8 @@ public class ServerLogin extends Module {
     private void resetState() {
         state.set(State.WAITING);
         sentLoginCommand = false;
+        walkGoal = null;
         walkTicks = 0;
-        stopWalkTask();
-    }
-
-    private void stopWalkTask() {
-        if (walkTask != null && !walkTask.isDone()) {
-            walkTask.cancel(false);
-            walkTask = null;
-        }
     }
 
     /**
@@ -144,144 +143,126 @@ public class ServerLogin extends Module {
         }
 
         // ===== SUCCESS MESSAGE =====
+        // 6b6t: "Melon_kits, you are now logged in! Please enter the server through the portal."
         if (currentState == State.AUTHENTICATING && (
-                msg.contains("successfully logged in")
+                msg.contains("you are now logged in")
+                || msg.contains("successfully logged in")
                 || msg.contains("successfully registered")
-                || msg.contains("successful")
-                || msg.contains("authenticated")
                 || msg.contains("has been registered")
-                || msg.contains("logged in")
-                || msg.contains("login successful"))) {
+                || msg.contains("logged in!"))) {
             info("Server login successful! Waiting {}s for teleport to portal lobby...", TELEPORT_WAIT_SECONDS);
             state.set(State.WAITING_TELEPORT);
 
-            // 6b6t teleports us to a second lobby after login
-            // Wait for that teleport to complete, then start walking
+            // 6b6t teleports to a portal lobby after login
+            // Wait for that teleport, then mark online and start walking with proper physics
             EXECUTOR.schedule(this::startWalkPhase, TELEPORT_WAIT_SECONDS, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * After the teleport to the portal lobby, read current position
-     * and start walking forward using raw position packets.
+     * After the teleport to the portal lobby:
+     * 1. Mark bot as ONLINE (starts Bot ticks, INPUTS system, full physics simulation)
+     * 2. Set a walk goal forward
+     * 3. Walk using the INPUTS system (same as AntiAFK) which the server accepts
      */
     private void startWalkPhase() {
-        state.set(State.WALKING);
-        walkTicks = 0;
+        // Read position AFTER the teleport to portal lobby
+        startX = CACHE.getPlayerCache().getX();
+        startZ = CACHE.getPlayerCache().getZ();
+        float yaw = CACHE.getPlayerCache().getYaw();
 
-        // Read position AFTER the teleport
-        walkX = CACHE.getPlayerCache().getX();
-        walkY = CACHE.getPlayerCache().getY();
-        walkZ = CACHE.getPlayerCache().getZ();
-        walkYaw = CACHE.getPlayerCache().getYaw();
-        walkPitch = 0.0f; // look straight ahead
+        info("Portal lobby position: ({}, {}, {}), yaw: {}",
+            String.format("%.1f", startX),
+            String.format("%.1f", (double) CACHE.getPlayerCache().getY()),
+            String.format("%.1f", startZ),
+            String.format("%.1f", (double) yaw));
 
-        startX = walkX;
-        startZ = walkZ;
+        // Calculate walk goal WALK_DISTANCE blocks forward from current position
+        double rad = Math.toRadians(yaw);
+        double goalX = startX - Math.sin(rad) * WALK_DISTANCE;
+        double goalZ = startZ + Math.cos(rad) * WALK_DISTANCE;
 
-        // Calculate forward direction from yaw
-        double rad = Math.toRadians(walkYaw);
-        walkDirX = -Math.sin(rad);
-        walkDirZ = Math.cos(rad);
+        walkGoal = new BlockPos(
+            MathHelper.floorI(goalX),
+            MathHelper.floorI(CACHE.getPlayerCache().getY()),
+            MathHelper.floorI(goalZ)
+        );
 
-        info("Portal lobby position: ({}, {}, {}), yaw: {}", 
-            String.format("%.1f", walkX), String.format("%.1f", walkY), String.format("%.1f", walkZ),
-            String.format("%.1f", (double) walkYaw));
-        info("Walking forward {} blocks toward portal...", MAX_WALK_DISTANCE);
+        info("Walking toward portal at ({}, {})...", walkGoal.x(), walkGoal.z());
 
-        // Schedule walk ticks at 50ms intervals (20 ticks/sec) to match MC tick rate
-        walkTask = EXECUTOR.scheduleAtFixedRate(this::walkTick, 0, 50, TimeUnit.MILLISECONDS);
-    }
-
-    /**
-     * Each walk tick:
-     * - Move position forward slightly
-     * - Send position packet to server
-     * - Check if we've been teleported (portal)
-     */
-    private void walkTick() {
-        try {
-            if (state.get() != State.WALKING) {
-                stopWalkTask();
-                return;
-            }
-
-            walkTicks++;
-
-            // Check if server teleported us (portal detection)
-            double serverX = CACHE.getPlayerCache().getX();
-            double serverZ = CACHE.getPlayerCache().getZ();
-            double distFromStart = Math.sqrt(
-                Math.pow(serverX - startX, 2) +
-                Math.pow(serverZ - startZ, 2)
-            );
-
-            if (distFromStart > PORTAL_DETECT_DISTANCE) {
-                info("Portal detected! Server moved us to ({}, {}). Distance from start: {}",
-                    String.format("%.1f", serverX), String.format("%.1f", serverZ),
-                    String.format("%.1f", distFromStart));
-                finishLogin();
-                return;
-            }
-
-            // Check walk distance limit
-            double walkedDistance = Math.sqrt(
-                Math.pow(walkX - startX, 2) +
-                Math.pow(walkZ - startZ, 2)
-            );
-
-            if (walkedDistance >= MAX_WALK_DISTANCE) {
-                info("Reached max walk distance ({}). Checking if portal was missed...", MAX_WALK_DISTANCE);
-                // Give a few more seconds for the server to process
-                if (walkTicks > MAX_WALK_TICKS) {
-                    info("Walk timeout. Marking as online anyway.");
-                    finishLogin();
-                    return;
-                }
-                // Stop moving forward but keep checking for teleport
-                return;
-            }
-
-            // Safety timeout
-            if (walkTicks > MAX_WALK_TICKS) {
-                info("Walk phase timed out after {} ticks. Marking as online.", walkTicks);
-                finishLogin();
-                return;
-            }
-
-            // Move forward
-            walkX += walkDirX * WALK_SPEED;
-            walkZ += walkDirZ * WALK_SPEED;
-
-            // Send position to server
-            sendClientPacketAsync(new ServerboundMovePlayerPosRotPacket(
-                true,   // onGround
-                false,  // horizontalCollision
-                walkX,
-                walkY,
-                walkZ,
-                walkYaw,
-                walkPitch
-            ));
-
-        } catch (Exception e) {
-            error("Error during walk tick: {}", e.getMessage());
-            finishLogin();
-        }
-    }
-
-    /**
-     * Portal reached or timeout — mark the session as fully online.
-     */
-    private void finishLogin() {
-        stopWalkTask();
-        state.set(State.DONE);
-
+        // Mark bot as ONLINE — this starts Bot ticks and the INPUTS system
+        // which provide full physics simulation (gravity, ground detection, etc.)
+        // Raw position packets get rejected by anti-cheat without this
         var client = Proxy.getInstance().getClient();
         if (client != null && !client.isOnline()) {
             client.setOnline(true);
             EVENT_BUS.post(new ClientOnlineEvent());
+            info("Bot marked online. Physics simulation started.");
         }
-        info("ServerLogin complete. Bot is fully online.");
+
+        // Now set state to WALKING — handleTick() will pick this up via ClientBotTick
+        state.set(State.WALKING);
+        walkTicks = 0;
+    }
+
+    /**
+     * Each bot tick during WALKING state:
+     * - Submit forward movement via INPUTS (proper physics)
+     * - Check if portal teleported us
+     */
+    private void handleTick(ClientBotTick event) {
+        if (state.get() != State.WALKING) return;
+        if (walkGoal == null) return;
+
+        walkTicks++;
+
+        double currentX = World.getCurrentPlayerX();
+        double currentZ = World.getCurrentPlayerZ();
+
+        // Check if we were teleported far from where we started (portal!)
+        double distFromStart = Math.sqrt(
+            Math.pow(currentX - startX, 2) +
+            Math.pow(currentZ - startZ, 2)
+        );
+
+        if (distFromStart > PORTAL_DETECT_DISTANCE) {
+            info("Portal detected! Teleported to ({}, {}). Distance from start: {}",
+                String.format("%.1f", currentX), String.format("%.1f", currentZ),
+                String.format("%.1f", distFromStart));
+            state.set(State.DONE);
+            walkGoal = null;
+            info("ServerLogin complete.");
+            return;
+        }
+
+        // Check if we reached the walk goal
+        int px = MathHelper.floorI(currentX);
+        int pz = MathHelper.floorI(currentZ);
+        if (px == walkGoal.x() && pz == walkGoal.z()) {
+            info("Reached walk goal. Portal should have triggered.");
+            state.set(State.DONE);
+            walkGoal = null;
+            info("ServerLogin complete.");
+            return;
+        }
+
+        // Timeout
+        if (walkTicks > MAX_WALK_TICKS) {
+            info("Walk phase timed out after {} ticks. Continuing as online.", walkTicks);
+            state.set(State.DONE);
+            walkGoal = null;
+            return;
+        }
+
+        // Submit movement: walk forward toward the goal using proper physics
+        // This is the same system AntiAFK uses — the server accepts this movement
+        INPUTS.submit(InputRequest.builder()
+            .owner(this)
+            .input(Input.builder()
+                .pressingForward(true)
+                .build())
+            .yaw(RotationHelper.yawToXZ(walkGoal.x() + 0.5, walkGoal.z() + 0.5))
+            .priority(10000) // Very high priority — override AntiAFK etc.
+            .build());
     }
 }
