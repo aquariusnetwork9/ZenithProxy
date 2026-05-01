@@ -47,6 +47,10 @@ public final class Config {
         public boolean alwaysRefreshOnLogin = false;
         public int maxRefreshIntervalMins = 360; // 6 hrs
         public boolean useClientConnectionProxy = false;
+        // 6b6t cracked server /login or /register password
+        public String serverPassword = "";
+        // set to true if the server has a lobby that requires /login or /register before playing
+        public boolean serverLoginRequired = false;
 
         public enum AccountType {
             @SerializedName("msa") MSA,
