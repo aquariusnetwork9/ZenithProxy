@@ -36,9 +36,11 @@ public class TabListDataHandler implements ClientEventLoopPacketHandler<Clientbo
 //                parse2bPing(packet, session);
             }
         } else {
-            if (!session.isOnline()) {
-                session.setOnline(true);
-                EVENT_BUS.post(new ClientOnlineEvent());
+            if (!CONFIG.authentication.serverLoginRequired) {
+                if (!session.isOnline()) {
+                    session.setOnline(true);
+                    EVENT_BUS.post(new ClientOnlineEvent());
+                }
             }
         }
         return true;
