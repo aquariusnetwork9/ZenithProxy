@@ -167,6 +167,11 @@ public class ServerLogin extends Module {
     }
 
     private void startWalkPhase() {
+        // Auth is verified at this point. Set the flag NOW so that if a server
+        // transfer happens during the walk (before completeAuth runs),
+        // the new connection will auto-online via LoginHandler/TabListDataHandler.
+        authComplete = true;
+
         startX = CACHE.getPlayerCache().getX();
         startZ = CACHE.getPlayerCache().getZ();
         float yaw = CACHE.getPlayerCache().getYaw();
