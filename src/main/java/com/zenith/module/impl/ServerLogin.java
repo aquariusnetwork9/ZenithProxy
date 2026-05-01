@@ -3,17 +3,15 @@ package com.zenith.module.impl;
 import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
 import com.zenith.event.chat.SystemChatEvent;
-import com.zenith.event.client.ClientBotTick;
 import com.zenith.event.client.ClientConnectEvent;
 import com.zenith.event.client.ClientDisconnectEvent;
 import com.zenith.event.client.ClientOnlineEvent;
-import com.zenith.feature.player.*;
-import com.zenith.mc.block.BlockPos;
 import com.zenith.module.api.Module;
-import com.zenith.util.math.MathHelper;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.ServerboundChatPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.player.ServerboundMovePlayerPosRotPacket;
 
 import java.util.List;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -22,26 +20,20 @@ import static com.zenith.Globals.*;
 
 /**
  * Handles /login and /register for cracked servers like 6b6t.
- * After successful login, walks forward ~15 blocks into the portal
- * to reach the main game server.
  *
- * HOW TO USE:
- *   1. Set authentication.accountType to "offline" in config or via Discord
- *   2. Set authentication.username to your bot's name
- *   3. Set authentication.serverPassword to your /login password
- *   4. Set authentication.serverLoginRequired to true
- *
- * STATES:
- *   WAITING        - Connected, waiting for login/register prompt
- *   AUTHENTICATING - Sent /login or /register, waiting for success message
- *   WALKING        - Login succeeded, walking toward portal
- *   DONE           - Through the portal, fully online
+ * Flow:
+ *   1. WAITING      - Waits for login/register prompt
+ *   2. AUTHENTICATING - Sent /login, waiting for success
+ *   3. WAITING_TELEPORT - Login succeeded, waiting for 6b6t to teleport us to the portal lobby
+ *   4. WALKING      - Walking forward toward the portal using raw position packets
+ *   5. DONE         - Through the portal, fully online
  */
 public class ServerLogin extends Module {
 
     private enum State {
         WAITING,
         AUTHENTICATING,
+        WAITING_TELEPORT,
         WALKING,
         DONE
     }
@@ -49,24 +41,31 @@ public class ServerLogin extends Module {
     private final AtomicReference<State> state = new AtomicReference<>(State.WAITING);
     private boolean sentLoginCommand = false;
 
-    // Walk phase variables
-    private BlockPos walkGoal;
-    private double spawnX, spawnZ;
+    // Walk phase
+    private ScheduledFuture<?> walkTask;
+    private double walkX, walkY, walkZ;     // current walk position
+    private double walkDirX, walkDirZ;      // direction to walk (unit vector)
+    private float walkYaw, walkPitch;       // facing direction
+    private double startX, startZ;          // position when walk started
     private int walkTicks = 0;
-    // 10 seconds at 20tps — safety timeout in case portal detection fails
-    private static final int MAX_WALK_TICKS = 200;
-    // If position jumps more than this many blocks from spawn, we hit the portal
-    private static final double PORTAL_TELEPORT_THRESHOLD = 20.0;
-    // How many blocks to walk forward toward the portal
-    private static final int WALK_DISTANCE = 15;
+
+    // Walking speed: ~4.3 blocks/sec = ~0.215 blocks/tick at 20tps
+    private static final double WALK_SPEED = 0.215;
+    // Max blocks to walk before giving up
+    private static final int MAX_WALK_DISTANCE = 20;
+    // If position jumps more than this from walk start, portal detected
+    private static final double PORTAL_DETECT_DISTANCE = 30.0;
+    // Max ticks to walk (15 seconds)
+    private static final int MAX_WALK_TICKS = 300;
+    // Seconds to wait after login for teleport to portal lobby
+    private static final int TELEPORT_WAIT_SECONDS = 4;
 
     @Override
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
             of(SystemChatEvent.class, this::handleSystemChat),
             of(ClientConnectEvent.class, this::handleConnect),
-            of(ClientDisconnectEvent.class, this::handleDisconnect),
-            of(ClientBotTick.class, this::handleTick)
+            of(ClientDisconnectEvent.class, this::handleDisconnect)
         );
     }
 
@@ -75,17 +74,11 @@ public class ServerLogin extends Module {
         return CONFIG.authentication.serverLoginRequired;
     }
 
-    /**
-     * Reset state when we start a new connection
-     */
     private void handleConnect(ClientConnectEvent event) {
         resetState();
         info("ServerLogin module ready, waiting for lobby auth prompt...");
     }
 
-    /**
-     * Reset state when we disconnect
-     */
     private void handleDisconnect(ClientDisconnectEvent event) {
         resetState();
     }
@@ -93,18 +86,23 @@ public class ServerLogin extends Module {
     private void resetState() {
         state.set(State.WAITING);
         sentLoginCommand = false;
-        walkGoal = null;
         walkTicks = 0;
+        stopWalkTask();
+    }
+
+    private void stopWalkTask() {
+        if (walkTask != null && !walkTask.isDone()) {
+            walkTask.cancel(false);
+            walkTask = null;
+        }
     }
 
     /**
-     * Listen to every system chat message from the server.
-     * 6b6t sends: "Melon_kits, please login with the command: /login <password>"
-     * After success, transitions to WALKING state.
+     * Listen for lobby auth prompts and success messages.
      */
     private void handleSystemChat(SystemChatEvent event) {
         State currentState = state.get();
-        if (currentState == State.DONE || currentState == State.WALKING) return;
+        if (currentState == State.DONE || currentState == State.WALKING || currentState == State.WAITING_TELEPORT) return;
 
         String msg = event.message().toLowerCase();
 
@@ -154,97 +152,130 @@ public class ServerLogin extends Module {
                 || msg.contains("has been registered")
                 || msg.contains("logged in")
                 || msg.contains("login successful"))) {
-            info("Server login successful! Starting walk to portal...");
-            startWalkPhase();
+            info("Server login successful! Waiting {}s for teleport to portal lobby...", TELEPORT_WAIT_SECONDS);
+            state.set(State.WAITING_TELEPORT);
+
+            // 6b6t teleports us to a second lobby after login
+            // Wait for that teleport to complete, then start walking
+            EXECUTOR.schedule(this::startWalkPhase, TELEPORT_WAIT_SECONDS, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * After login succeeds, record current position and calculate a walk goal
-     * in the direction the bot is currently facing.
+     * After the teleport to the portal lobby, read current position
+     * and start walking forward using raw position packets.
      */
     private void startWalkPhase() {
         state.set(State.WALKING);
         walkTicks = 0;
 
-        // Record spawn position
-        spawnX = World.getCurrentPlayerX();
-        spawnZ = World.getCurrentPlayerZ();
+        // Read position AFTER the teleport
+        walkX = CACHE.getPlayerCache().getX();
+        walkY = CACHE.getPlayerCache().getY();
+        walkZ = CACHE.getPlayerCache().getZ();
+        walkYaw = CACHE.getPlayerCache().getYaw();
+        walkPitch = 0.0f; // look straight ahead
 
-        // Get the direction the bot is facing
-        float yaw = CACHE.getPlayerCache().getYaw();
+        startX = walkX;
+        startZ = walkZ;
 
-        // Calculate goal position WALK_DISTANCE blocks forward
-        // Minecraft yaw: 0 = south (+Z), 90 = west (-X), 180 = north (-Z), 270 = east (+X)
-        double rad = Math.toRadians(yaw);
-        double goalX = spawnX - Math.sin(rad) * WALK_DISTANCE;
-        double goalZ = spawnZ + Math.cos(rad) * WALK_DISTANCE;
+        // Calculate forward direction from yaw
+        double rad = Math.toRadians(walkYaw);
+        walkDirX = -Math.sin(rad);
+        walkDirZ = Math.cos(rad);
 
-        walkGoal = new BlockPos(
-            MathHelper.floorI(goalX),
-            MathHelper.floorI(World.getCurrentPlayerY()),
-            MathHelper.floorI(goalZ)
-        );
+        info("Portal lobby position: ({}, {}, {}), yaw: {}", 
+            String.format("%.1f", walkX), String.format("%.1f", walkY), String.format("%.1f", walkZ),
+            String.format("%.1f", (double) walkYaw));
+        info("Walking forward {} blocks toward portal...", MAX_WALK_DISTANCE);
 
-        info("Walking from ({}, {}) toward portal at ({}, {})",
-            MathHelper.floorI(spawnX), MathHelper.floorI(spawnZ),
-            walkGoal.x(), walkGoal.z());
+        // Schedule walk ticks at 50ms intervals (20 ticks/sec) to match MC tick rate
+        walkTask = EXECUTOR.scheduleAtFixedRate(this::walkTick, 0, 50, TimeUnit.MILLISECONDS);
     }
 
     /**
-     * Each tick during the WALKING state:
-     * - Walk toward the portal goal
-     * - Check if we've been teleported (= portal detected)
-     * - Safety timeout after MAX_WALK_TICKS
+     * Each walk tick:
+     * - Move position forward slightly
+     * - Send position packet to server
+     * - Check if we've been teleported (portal)
      */
-    private void handleTick(ClientBotTick event) {
-        if (state.get() != State.WALKING) return;
-        if (walkGoal == null) return;
+    private void walkTick() {
+        try {
+            if (state.get() != State.WALKING) {
+                stopWalkTask();
+                return;
+            }
 
-        walkTicks++;
+            walkTicks++;
 
-        double currentX = World.getCurrentPlayerX();
-        double currentZ = World.getCurrentPlayerZ();
+            // Check if server teleported us (portal detection)
+            double serverX = CACHE.getPlayerCache().getX();
+            double serverZ = CACHE.getPlayerCache().getZ();
+            double distFromStart = Math.sqrt(
+                Math.pow(serverX - startX, 2) +
+                Math.pow(serverZ - startZ, 2)
+            );
 
-        // Check if we were teleported far away from spawn (portal!)
-        double distFromSpawn = Math.sqrt(
-            Math.pow(currentX - spawnX, 2) +
-            Math.pow(currentZ - spawnZ, 2)
-        );
+            if (distFromStart > PORTAL_DETECT_DISTANCE) {
+                info("Portal detected! Server moved us to ({}, {}). Distance from start: {}",
+                    String.format("%.1f", serverX), String.format("%.1f", serverZ),
+                    String.format("%.1f", distFromStart));
+                finishLogin();
+                return;
+            }
 
-        // If position jumped way beyond our walk path, we went through the portal
-        if (distFromSpawn > WALK_DISTANCE + PORTAL_TELEPORT_THRESHOLD) {
-            info("Portal detected! Teleported to ({}, {}). Now fully online.",
-                MathHelper.floorI(currentX), MathHelper.floorI(currentZ));
+            // Check walk distance limit
+            double walkedDistance = Math.sqrt(
+                Math.pow(walkX - startX, 2) +
+                Math.pow(walkZ - startZ, 2)
+            );
+
+            if (walkedDistance >= MAX_WALK_DISTANCE) {
+                info("Reached max walk distance ({}). Checking if portal was missed...", MAX_WALK_DISTANCE);
+                // Give a few more seconds for the server to process
+                if (walkTicks > MAX_WALK_TICKS) {
+                    info("Walk timeout. Marking as online anyway.");
+                    finishLogin();
+                    return;
+                }
+                // Stop moving forward but keep checking for teleport
+                return;
+            }
+
+            // Safety timeout
+            if (walkTicks > MAX_WALK_TICKS) {
+                info("Walk phase timed out after {} ticks. Marking as online.", walkTicks);
+                finishLogin();
+                return;
+            }
+
+            // Move forward
+            walkX += walkDirX * WALK_SPEED;
+            walkZ += walkDirZ * WALK_SPEED;
+
+            // Send position to server
+            sendClientPacketAsync(new ServerboundMovePlayerPosRotPacket(
+                true,   // onGround
+                false,  // horizontalCollision
+                walkX,
+                walkY,
+                walkZ,
+                walkYaw,
+                walkPitch
+            ));
+
+        } catch (Exception e) {
+            error("Error during walk tick: {}", e.getMessage());
             finishLogin();
-            return;
         }
-
-        // Safety timeout
-        if (walkTicks > MAX_WALK_TICKS) {
-            info("Walk phase timed out after {} ticks. Marking as online.", walkTicks);
-            finishLogin();
-            return;
-        }
-
-        // Submit movement input: walk forward, facing the goal
-        INPUTS.submit(InputRequest.builder()
-            .owner(this)
-            .input(Input.builder()
-                .pressingForward(true)
-                .build())
-            .yaw(RotationHelper.yawToXZ(walkGoal.x() + 0.5, walkGoal.z() + 0.5))
-            .priority(1000)
-            .build());
     }
 
     /**
-     * Portal reached or timeout — mark the session as fully online
-     * so all other modules (AutoEat, KillAura, etc.) start working.
+     * Portal reached or timeout — mark the session as fully online.
      */
     private void finishLogin() {
+        stopWalkTask();
         state.set(State.DONE);
-        walkGoal = null;
 
         var client = Proxy.getInstance().getClient();
         if (client != null && !client.isOnline()) {
