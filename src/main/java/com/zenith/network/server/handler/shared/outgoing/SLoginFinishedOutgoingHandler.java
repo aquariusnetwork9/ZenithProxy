@@ -132,6 +132,7 @@ public class SLoginFinishedOutgoingHandler implements PacketHandler<ClientboundL
 
     private void finishLogin(ServerSession session, GameProfile clientGameProfile, final AuthorizationState authState) {
         synchronized (this) {
+            SERVER_LOG.info("[DEBUG] isConnected: {}", Proxy.getInstance().isConnected());
             if (!Proxy.getInstance().isConnected()) {
                     if (CONFIG.client.extra.autoConnectOnLogin && authState != AuthorizationState.SPECTATOR) {
                     try {
@@ -160,6 +161,12 @@ public class SLoginFinishedOutgoingHandler implements PacketHandler<ClientboundL
             }
         }
         var client = Proxy.getInstance().getClient();
+        // DEBUG: Log each condition to find why player connection is rejected
+        SERVER_LOG.info("[DEBUG] client null: {}, profile null: {}, isOnline: {}, isInQueue: {}",
+            client == null,
+            CACHE.getProfileCache().getProfile() == null,
+            client != null ? client.isOnline() : "N/A",
+            client != null ? client.isInQueue() : "N/A");
         if (client == null
             || CACHE.getProfileCache().getProfile() == null
             || !(client.isOnline() || client.isInQueue())) {
