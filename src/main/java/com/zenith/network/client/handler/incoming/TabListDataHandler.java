@@ -2,6 +2,7 @@ package com.zenith.network.client.handler.incoming;
 
 import com.zenith.Proxy;
 import com.zenith.event.client.ClientOnlineEvent;
+import com.zenith.module.impl.ServerLogin;
 import com.zenith.event.client.PrioStatusEvent;
 import com.zenith.event.queue.QueueCompleteEvent;
 import com.zenith.event.queue.QueueStartEvent;
@@ -36,7 +37,7 @@ public class TabListDataHandler implements ClientEventLoopPacketHandler<Clientbo
 //                parse2bPing(packet, session);
             }
         } else {
-            if (!CONFIG.authentication.serverLoginRequired) {
+            if (!CONFIG.authentication.serverLoginRequired || ServerLogin.isAuthComplete()) {
                 if (!session.isOnline()) {
                     session.setOnline(true);
                     EVENT_BUS.post(new ClientOnlineEvent());
