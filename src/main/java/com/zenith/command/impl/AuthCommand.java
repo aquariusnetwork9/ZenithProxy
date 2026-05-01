@@ -35,14 +35,24 @@ public class AuthCommand extends Command {
             If authentication fails, try logging into the account on the vanilla MC launcher and joining a server. Then try again in Zenith.
             If this still fails, try one of the alternate auth types.
 
+            For cracked/offline servers (like 6b6t):
+            1. `auth type offline`
+            2. `auth username YourBotName`
+            3. `auth serverPassword YourPassword`
+            4. `auth serverLoginRequired on`
+            Then use `connect` to join.
+
             """)
             .usageLines(
                 "clear",
                 "attempts <int>",
                 "alwaysRefreshOnLogin on/off",
-                "type <deviceCode/emailAndPassword/prism>",
+                "type <deviceCode/emailAndPassword/prism/offline>",
                 "email <email>",
                 "password <password>",
+                "username <name>",
+                "serverPassword <password>",
+                "serverLoginRequired on/off",
                 "mention on/off",
                 "openBrowser on/off",
                 "maxRefreshIntervalMins <minutes>",
@@ -84,12 +94,13 @@ public class AuthCommand extends Command {
                 return OK;
             })))
             .then(literal("type").requires(this::validateDiscordOrTerminalSource)
-                .then(argument("typeArg", enumStrings("deviceCode", "emailAndPassword", "prism")).executes(c -> {
+                .then(argument("typeArg", enumStrings("deviceCode", "emailAndPassword", "prism", "offline")).executes(c -> {
                     String type = getString(c, "typeArg");
                     Config.Authentication.AccountType accountType = switch (type) {
                         case "deviceCode" -> Config.Authentication.AccountType.DEVICE_CODE;
                         case "emailAndPassword" -> Config.Authentication.AccountType.MSA;
                         case "prism" -> Config.Authentication.AccountType.PRISM;
+                        case "offline" -> Config.Authentication.AccountType.OFFLINE;
                         default -> null;
                     };
                     if (accountType == null) {
@@ -169,6 +180,48 @@ public class AuthCommand extends Command {
                     .primaryColor();
                 return OK;
             })))
+            .then(literal("username")
+                .then(argument("username", wordWithChars()).executes(c -> {
+                    var usernameStr = getString(c, "username").trim();
+                    if (usernameStr.isBlank() || usernameStr.length() < 3 || usernameStr.length() > 16) {
+                        c.getSource().getEmbed()
+                            .title("Invalid Username")
+                            .description("Username must be 3-16 characters")
+                            .errorColor();
+                        return ERROR;
+                    }
+                    CONFIG.authentication.username = usernameStr;
+                    c.getSource().getEmbed()
+                        .title("Username Set")
+                        .description("Username set to: " + usernameStr)
+                        .primaryColor();
+                    return OK;
+                })))
+            .then(literal("serverPassword")
+                .then(argument("serverPassword", wordWithChars()).executes(c -> {
+                    c.getSource().setSensitiveInput(true);
+                    var passStr = getString(c, "serverPassword").trim();
+                    if (passStr.isBlank()) {
+                        c.getSource().getEmbed()
+                            .title("Invalid Server Password")
+                            .errorColor();
+                        return ERROR;
+                    }
+                    CONFIG.authentication.serverPassword = passStr;
+                    c.getSource().getEmbed()
+                        .title("Server Password Set")
+                        .description("The /login password for the cracked server has been saved")
+                        .primaryColor();
+                    return OK;
+                })))
+            .then(literal("serverLoginRequired").then(argument("toggle", toggle()).executes(c -> {
+                CONFIG.authentication.serverLoginRequired = getToggle(c, "toggle");
+                c.getSource().getEmbed()
+                    .title("Server Login Required " + toggleStrCaps(CONFIG.authentication.serverLoginRequired))
+                    .description("When ON, the bot will wait for /login or /register prompts before marking itself as online")
+                    .primaryColor();
+                return OK;
+            })))
             .then(literal("chatSigning")
                 .then(argument("toggle", toggle()).executes(c -> {
                     CONFIG.client.chatSigning.enabled = getToggle(c, "toggle");
@@ -205,8 +258,11 @@ public class AuthCommand extends Command {
     public void defaultEmbed(final Embed builder) {
         builder
             .addField("Account Type", authTypeToString(CONFIG.authentication.accountType))
+            .addField("Username", CONFIG.authentication.username)
             .addField("Attempts", CONFIG.authentication.msaLoginAttemptsBeforeCacheWipe)
             .addField("Always Refresh On Login", toggleStr(CONFIG.authentication.alwaysRefreshOnLogin))
+            .addField("Server Login Required", toggleStr(CONFIG.authentication.serverLoginRequired))
+            .addField("Server Password", CONFIG.authentication.serverPassword.isEmpty() ? "Not Set" : "Set (hidden)")
             .addField("Mention", toggleStr(CONFIG.discord.mentionRoleOnDeviceCodeAuth))
             .addField("Open Browser", toggleStr(CONFIG.authentication.openBrowserOnLogin))
             .addField("Max Refresh Interval", CONFIG.authentication.maxRefreshIntervalMins + " minutes")
