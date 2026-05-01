@@ -39,6 +39,7 @@ public class ModuleManager {
             new QueueWarning(),
             new ReplayMod(),
             new Requeue(),
+            new ServerLogin(),
             new SessionTimeLimit(),
             new Spammer(),
             new Spook(),
