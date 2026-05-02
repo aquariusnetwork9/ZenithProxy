@@ -97,7 +97,9 @@ public class ServerLogin extends Module {
     }
 
     private void handleDisconnect(ClientDisconnectEvent event) {
-        // Don't reset authComplete — it persists across transfers
+        // Reset walk state but keep authComplete for transfer scenarios.
+        // If we land in a login lobby again, handleSystemChat will detect the
+        // login prompt and reset authComplete automatically.
         state.set(State.WAITING);
         sentLoginCommand = false;
         walkGoal = null;
@@ -113,9 +115,27 @@ public class ServerLogin extends Module {
 
     private void handleSystemChat(SystemChatEvent event) {
         State currentState = state.get();
-        if (currentState == State.DONE || currentState == State.WALKING || currentState == State.WAITING_TELEPORT) return;
+        if (currentState == State.WALKING || currentState == State.WAITING_TELEPORT) return;
 
         String msg = event.message().toLowerCase();
+
+        // ===== RE-LOGIN DETECTION =====
+        // If we see the login prompt while already authenticated (e.g. after a disconnect
+        // and reconnect), reset everything and re-authenticate
+        if (msg.contains("please login with the command") && (currentState == State.DONE || currentState == State.AUTHENTICATING)) {
+            info("Login prompt detected after reconnect. Re-authenticating...");
+            authComplete = false;
+            resetState();
+            currentState = State.WAITING;
+            sentLoginCommand = false;
+        }
+        if (msg.contains("please register") && (currentState == State.DONE || currentState == State.AUTHENTICATING)) {
+            info("Register prompt detected after reconnect. Re-authenticating...");
+            authComplete = false;
+            resetState();
+            currentState = State.WAITING;
+            sentLoginCommand = false;
+        }
 
         // ===== LOGIN PROMPT =====
         if (currentState == State.WAITING
